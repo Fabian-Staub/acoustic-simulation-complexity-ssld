@@ -1,0 +1,35 @@
+name: master_thesis_pyroom_env
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - numpy
+  - compilers
+  - cmake
+  - make
+  - matplotlib=3.4
+  - pandas
+  - scipy=1.14
+  - librosa
+  - tqdm==4.65.0
+  - shapely==2.0.7
+  - compilers
+  - libstdcxx-ng
+  - libgcc-ng
+  - ipython
+
+  - portaudio
+  - libsndfile
+
+  - pip
+  - pip:
+      - pyroomacoustics
+      - soundfile
+      - spaudiopy
+      - pyfar
+      - sofar
+      - spharpy
+      - datasets
+      - "pyshroom[dev]"
+      - sounddevice
+      - python-sofa

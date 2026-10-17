@@ -1,0 +1,29 @@
+name: master_thesis_env
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - pandas
+  - matplotlib=3.7
+  - scipy=1.10
+  - librosa
+  - tqdm==4.65.0
+  - shapely==2.0.7
+  - compilers
+  - libstdcxx-ng
+  - libgcc-ng
+  - ipython
+
+  - pip:
+    - soundfile
+    - spaudiopy
+    - pyfar
+    - sofar
+    - spharpy
+    - torch==2.4.1
+    - torchinfo
+    - torchvision
+    - torchaudio
+    - datasets
+    - pyroomacoustics==0.7.7

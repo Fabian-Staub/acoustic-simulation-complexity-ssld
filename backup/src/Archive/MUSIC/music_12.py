@@ -1,0 +1,389 @@
+import torch
+import numpy as np
+import spaudiopy as spa
+import os
+import sys
+import time
+import resource
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../ML_model/scm_model")))
+from evaluate_5 import match_tracks, init_metrics, update_metrics, compute_seld, print_metrics
+
+
+# =========================================================
+# DATA LOADING
+# =========================================================
+def load_dataset(pt_path):
+    data = torch.load(pt_path)
+    X = data["X"].numpy()
+    Y = data["Y"].numpy()
+
+    # inverse normalization from [0,1] -> [-1,1]
+    X = 2.0 * X - 1.0
+
+    return X, Y
+
+
+# =========================================================
+# ANGULAR DISTANCE
+# =========================================================
+def angular_distance(a, b):
+    a = a / (np.linalg.norm(a) + 1e-10)
+    b = b / (np.linalg.norm(b) + 1e-10)
+    dot = np.clip(np.dot(a, b), -1.0, 1.0)
+    return np.degrees(np.arccos(dot))
+
+
+# =========================================================
+# EIG / SUBSPACE
+# =========================================================
+def eig_decompose(scm):
+    evals, evecs = np.linalg.eigh(scm)
+    idx = np.argsort(evals)[::-1]
+    return evals[idx].real, evecs[:, idx]
+
+
+def estimate_subspaces(evecs, num_sources):
+    return evecs[:, num_sources:]
+
+
+# =========================================================
+# DOA HELPERS (UPDATED: return indices too)
+# =========================================================
+def estimate_doa_topk(AZ, ZEN, P, K, min_sep_deg=15):
+    flat = P.ravel()
+    idx_sorted = np.argsort(flat)[::-1]
+
+    az_all = np.rad2deg(AZ.ravel())
+    el_all = 90 - np.rad2deg(ZEN.ravel())
+
+    selected = []
+    selected_idx = []
+
+    def dist(a1, e1, a2, e2):
+        return np.sqrt((a1 - a2) ** 2 + (e1 - e2) ** 2)
+
+    for idx in idx_sorted:
+        cand = (az_all[idx], el_all[idx])
+
+        if all(dist(cand[0], cand[1], s[0], s[1]) >= min_sep_deg for s in selected):
+            selected.append(cand)
+            selected_idx.append(idx)
+
+        if len(selected) >= K:
+            break
+
+    if len(selected) == 0:
+        return np.array([]), np.array([]), np.array([])
+
+    az = np.array([s[0] for s in selected])
+    el = np.array([s[1] for s in selected])
+
+    return az, el, np.array(selected_idx, dtype=int)
+
+
+def azel_to_cartesian(az_deg, el_deg):
+    az = np.deg2rad(az_deg)
+    el = np.deg2rad(el_deg)
+
+    x = np.cos(el) * np.cos(az)
+    y = np.cos(el) * np.sin(az)
+    z = np.sin(el)
+
+    return np.stack([x, y, z], axis=-1)
+
+
+# =========================================================
+# PRECOMPUTE GRID
+# =========================================================
+def precompute_music_grid(order, az_grid, zen_grid):
+    AZ, ZEN = np.meshgrid(az_grid, zen_grid)
+
+    Y = spa.sph.sh_matrix(
+        order,
+        AZ.ravel(),
+        ZEN.ravel(),
+        sh_type="real"
+    ).T
+
+    return AZ, ZEN, Y, AZ.shape
+
+
+# =========================================================
+# QIU ET AL. SOURCE NUMBER ESTIMATION
+# =========================================================
+def build_steering_matrix_from_grid(az, el, Y, AZ, ZEN):
+    """
+    Map DOA estimates to closest spherical grid atoms.
+    Returns steering matrix A_e (M x K)
+    """
+
+    grid_az = np.rad2deg(AZ.ravel())
+    grid_el = 90 - np.rad2deg(ZEN.ravel())
+
+    A_e = []
+
+    for a, e in zip(az, el):
+        d = (grid_az - a) ** 2 + (grid_el - e) ** 2
+        idx = np.argmin(d)
+        A_e.append(Y[:, idx])   # steering vector for that grid point
+
+    return np.stack(A_e, axis=1)
+
+
+def qiu_source_number_estimation(X, az, el, Y, AZ, ZEN):
+    """
+    Implements Qiu et al. method:
+    - overestimated MUSIC DOAs
+    - reconstruct signal matrix
+    - count significant energies
+    """
+
+    K = len(az)
+    if K == 0:
+        return 0, np.array([])
+
+    # 1. Build steering matrix from estimated DOAs
+    A_e = build_steering_matrix_from_grid(az, el, Y, AZ, ZEN)
+
+    # 2. Convert SCM-band input to usable covariance proxy
+    # (your X is SCM bands: B x M x M)
+    if X.ndim == 3:
+        X_eff = np.mean(X, axis=0)  # (M, M)
+    else:
+        X_eff = X
+
+    # 3. Reconstruct source signals (Qiu step)
+    S_hat = np.linalg.pinv(A_e) @ X_eff
+
+    # 4. Compute source energies
+    energies = np.mean(np.abs(S_hat) ** 2, axis=1)
+
+    # 5. Decision rule (paper idea: strong positive components)
+    if len(energies) == 0:
+        return 0, np.array([])
+
+    thr = 0.3 * np.max(energies)
+    K_hat = int(np.sum(energies > thr))
+
+    return K_hat, energies
+
+
+# =========================================================
+# WORKER FUNCTION
+# =========================================================
+def process_sample(
+    i,
+    x_i,
+    y_i,
+    Y,
+    AZ,
+    ZEN,
+    grid_shape,
+    num_sources,
+    doa_threshold
+):
+    scm_bands = x_i
+    doa_gt = y_i
+
+    gt_active = doa_gt[np.linalg.norm(doa_gt, axis=1) > 0]
+
+    spectra = np.zeros(grid_shape, dtype=np.float64)
+    Yc = Y.conj()
+
+    for b in range(scm_bands.shape[0]):
+        scm = scm_bands[b]
+
+        _, evecs = eig_decompose(scm)
+        Qn = estimate_subspaces(evecs, num_sources)
+        Pn = Qn @ Qn.conj().T
+
+        denom = np.sum((Yc * (Pn @ Y)), axis=0).real
+        spectra += (1.0 / (denom + 1e-12)).reshape(grid_shape)
+
+    P_avg = spectra / scm_bands.shape[0]
+
+    az_est, el_est, idx_selected = estimate_doa_topk(
+        AZ, ZEN, P_avg, num_sources
+    )
+
+    pred_xyz = azel_to_cartesian(az_est, el_est)
+    valid_pred = pred_xyz if len(pred_xyz) > 0 else np.zeros((0, 3))
+
+    # =========================================================
+    # QIU METHOD (NEW)
+    # =========================================================
+    K_hat_qiu, qiu_energies = qiu_source_number_estimation(
+        scm_bands, az_est, el_est, Y, AZ, ZEN
+    )
+
+    # energy at MUSIC peaks (your original)
+    flat_P = P_avg.ravel()
+    energies = flat_P[idx_selected] if len(idx_selected) > 0 else np.array([])
+
+    dists = match_tracks(gt_active, valid_pred)
+    n_sources = len(gt_active)
+
+    return (
+        gt_active,
+        valid_pred,
+        dists,
+        n_sources,
+        az_est,
+        el_est,
+        energies,
+        K_hat_qiu,
+        qiu_energies
+    )
+
+
+# =========================================================
+# PARALLEL EVALUATION
+# =========================================================
+def evaluate_music_parallel(
+    x,
+    y,
+    Y,
+    AZ,
+    ZEN,
+    grid_shape,
+    num_sources,
+    doa_threshold=20,
+):
+
+    metrics_all = init_metrics()
+    metrics_1 = init_metrics()
+    metrics_2 = init_metrics()
+    metrics_3 = init_metrics()
+
+    N = x.shape[0]
+    results = []
+
+    num_workers = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count()))
+
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = [
+            executor.submit(
+                process_sample,
+                i, x[i], y[i],
+                Y, AZ, ZEN, grid_shape,
+                num_sources, doa_threshold
+            )
+            for i in range(N)
+        ]
+
+        for f in as_completed(futures):
+            results.append(f.result())
+
+    # ================= REDUCTION =================
+    for sample_idx, (
+        gt_active,
+        valid_pred,
+        dists,
+        n_sources,
+        az_est,
+        el_est,
+        energies,
+        K_hat_qiu,
+        qiu_energies
+    ) in enumerate(results):
+
+        print("\n" + "=" * 60)
+        print(f"Sample {sample_idx}")
+        print("=" * 60)
+
+        print("GT DOA(s):")
+        if len(gt_active) == 0:
+            print("  None")
+        else:
+            for k, gt in enumerate(gt_active):
+                print(f"  GT {k}: {gt}")
+
+        print("\nPredicted DOA(s):")
+        if len(valid_pred) == 0:
+            print("  None")
+        else:
+            for k, pred in enumerate(valid_pred):
+                print(f"  Pred {k}: {pred}")
+
+        print("\nEstimated source energies (MUSIC spectrum):")
+        if len(energies) == 0:
+            print("  None")
+        else:
+            for k, e in enumerate(energies):
+                print(f"  Source {k}: Energy = {e:.6e} | "
+                      f"AZ={az_est[k]:.2f}, EL={el_est[k]:.2f}")
+
+        print("\nAngular distances:")
+        print(dists)
+
+        print("\nQiu estimated number of sources:")
+        print(K_hat_qiu)
+
+        print("Qiu reconstructed energies:")
+        print(qiu_energies)
+
+        update_metrics(metrics_all, gt_active, valid_pred, dists, doa_threshold)
+
+        if n_sources == 1:
+            update_metrics(metrics_1, gt_active, valid_pred, dists, doa_threshold)
+        elif n_sources == 2:
+            update_metrics(metrics_2, gt_active, valid_pred, dists, doa_threshold)
+        elif n_sources == 3:
+            update_metrics(metrics_3, gt_active, valid_pred, dists, doa_threshold)
+
+    print_metrics("TOTAL", metrics_all)
+    print_metrics("1 source", metrics_1)
+    print_metrics("2 sources", metrics_2)
+    print_metrics("3 sources", metrics_3)
+
+    return (
+        compute_seld(metrics_all),
+        compute_seld(metrics_1),
+        compute_seld(metrics_2),
+        compute_seld(metrics_3)
+    )
+
+
+# =========================================================
+# MAIN
+# =========================================================
+if __name__ == "__main__":
+    start = time.time()
+
+    pt_path = "../../data/harp/R2000_P10_S5_Order4_24kHz_shoeBox_anisotropic_source-constraints_direct/harp_dataset_2-6kHz_8-SCM_randRot_multiSource_normalized.pt"
+
+    x, y = load_dataset(pt_path)
+
+    start_idx = int(0.999 * x.shape[0])
+    x = x[start_idx:]
+    y = y[start_idx:]
+
+    print(f"Using samples {start_idx} → {x.shape[0] + start_idx}")
+
+    order = 4
+    num_sources = 10
+
+    vecs = spa.grids.load_t_design(degree=21)
+    az_grid = np.arctan2(vecs[:, 1], vecs[:, 0])
+    zen_grid = np.arccos(vecs[:, 2])
+
+    AZ, ZEN, Y, grid_shape = precompute_music_grid(
+        order, az_grid, zen_grid
+    )
+
+    results = evaluate_music_parallel(
+        x, y, Y, AZ, ZEN,
+        grid_shape,
+        num_sources,
+        doa_threshold=20,
+    )
+
+    rusage_s = resource.getrusage(resource.RUSAGE_SELF)
+    rusage_c = resource.getrusage(resource.RUSAGE_CHILDREN)
+
+    print(f'Walltime {time.time()-start:.2f}s', file=sys.stderr)
+    print(f'User time {rusage_s.ru_utime+rusage_c.ru_utime:.2f}s', file=sys.stderr)
+    print(f'System time {rusage_s.ru_stime+rusage_c.ru_stime:.2f}s', file=sys.stderr)
+    print(f'MaxRSS {(rusage_s.ru_maxrss+rusage_c.ru_maxrss)/2**20:.3f} GiB', file=sys.stderr)

@@ -1,3 +1,5 @@
+# This script contains helper functions for the room simulation ("01_simulate_rooms_harp.py")
+
 import pyroomacoustics as pra
 from scipy.special import sph_harm
 from spaudiopy.sph import sh_matrix
